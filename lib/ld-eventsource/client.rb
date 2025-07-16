@@ -156,7 +156,9 @@ module SSE
 
       yield self if block_given?
 
+      trace_digest = capture_trace_digest
       Thread.new do
+        continue_trace_context(trace_digest)
         run_stream
       end
     end
@@ -378,6 +380,22 @@ module SSE
       }
       h['Last-Event-Id'] = @last_id if !@last_id.nil? && @last_id != ""
       h.merge(@headers)
+    end
+
+    def capture_trace_digest
+      return nil unless datadog_available?
+      active_trace = Datadog::Tracing.active_trace
+      return nil unless active_trace
+      active_trace.to_digest
+    end
+
+    def continue_trace_context(digest)
+      return unless datadog_available? && digest
+      Datadog::Tracing.continue_trace!(digest)
+    end
+
+    def datadog_available?
+      defined?(Datadog::Tracing) && defined?(Datadog::Tracing::TraceDigest)
     end
   end
 end

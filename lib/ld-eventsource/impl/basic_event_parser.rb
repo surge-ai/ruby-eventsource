@@ -3,7 +3,6 @@ require "ld-eventsource/events"
 module SSE
   module Impl
     class BasicEventParser
-
       def initialize(chunks)
         @chunks = chunks
       end

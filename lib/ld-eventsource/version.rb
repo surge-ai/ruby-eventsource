@@ -1,3 +1,3 @@
 module SSE
-  VERSION = "2.2.1"
+  VERSION = "2.2.6" # x-release-please-version
 end

@@ -7,6 +7,7 @@ require "ld-eventsource/errors"
 
 require "concurrent/atomics"
 require "logger"
+require "openssl"
 require "thread"
 require "uri"
 require "http"
@@ -50,6 +51,7 @@ module SSE
     # The default value for `reconnect_reset_interval` in {#initialize}.
     DEFAULT_RECONNECT_RESET_INTERVAL = 60
 
+    # The default HTTP method for requests.
     DEFAULT_HTTP_METHOD = "GET"
 
     #
@@ -87,8 +89,12 @@ module SSE
     # @param socket_factory [#open] (nil)  an optional factory object for creating sockets,
     #   if you want to use something other than the default `TCPSocket`; it must implement
     #   `open(uri, timeout)` to return a connected `Socket`
+    # @param http_method [String] (DEFAULT_HTTP_METHOD) the HTTP method to use for requests
+    # @param http_payload [Hash] ({}) JSON payload to send with requests (only used with POST/PUT methods)
+    # @param parse [Boolean] (true) whether to parse SSE events or pass through raw chunks
+    # @param verify_ssl [Boolean] (true) whether to verify SSL certificates; set to false for development/testing
     # @yieldparam [Client] client  the new client instance, before opening the connection
-    # 
+    #
     def initialize(uri,
           headers: {},
           connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -101,7 +107,8 @@ module SSE
           proxy: nil,
           logger: nil,
           socket_factory: nil,
-          parse: true)
+          parse: true,
+          verify_ssl: true)
       @uri = URI(uri)
       @stopped = Concurrent::AtomicBoolean.new(false)
 
@@ -112,15 +119,14 @@ module SSE
       @http_payload = http_payload
       @logger = logger || default_logger
       @parse = parse
-      http_client_options = {
-        ssl: {
-          verify_mode: OpenSSL::SSL::VERIFY_NONE # Ignore SSL verification
-        }
-      }
+      http_client_options = {}
+      unless verify_ssl
+        http_client_options[:ssl] = { verify_mode: OpenSSL::SSL::VERIFY_NONE }
+      end
       if socket_factory
         http_client_options["socket_class"] = socket_factory
       end
-      
+
       if proxy
         @proxy = proxy
       else
@@ -142,7 +148,7 @@ module SSE
       @http_client = HTTP::Client.new(http_client_options)
         .timeout({
           read: read_timeout,
-          connect: connect_timeout
+          connect: connect_timeout,
         })
       @cxn = nil
       @lock = Mutex.new
@@ -156,9 +162,7 @@ module SSE
 
       yield self if block_given?
 
-      Thread.new do
-        run_stream
-      end
+      Thread.new { run_stream }.name = 'LD/SSEClient'
     end
 
     #
@@ -217,15 +221,15 @@ module SSE
     end
 
     private
-    
+
     def reset_http
-      @http_client.close if !@http_client.nil?
+      @http_client.close unless @http_client.nil?
       close_connection
     end
-    
+
     def close_connection
       @lock.synchronize do
-        @cxn.connection.close if !@cxn.nil?
+        @cxn.connection.close unless @cxn.nil?
         @cxn = nil
       end
     end
@@ -233,12 +237,12 @@ module SSE
     def default_logger
       log = ::Logger.new($stdout)
       log.level = ::Logger::WARN
-      log.progname  = 'ld-eventsource'
+      log.progname = 'ld-eventsource'
       log
     end
 
     def run_stream
-      while !@stopped.value
+      until @stopped.value
         close_connection
         begin
           resp = connect
@@ -248,7 +252,7 @@ module SSE
           # There's a potential race if close was called in the middle of the previous line, i.e. after we
           # connected but before @cxn was set. Checking the variable again is a bit clunky but avoids that.
           return if @stopped.value
-          read_stream(resp) if !resp.nil?
+          read_stream(resp) unless resp.nil?
         rescue => e
           # When we deliberately close the connection, it will usually trigger an exception. The exact type
           # of exception depends on the specific Ruby runtime. But @stopped will always be set in this case.
@@ -273,24 +277,24 @@ module SSE
         interval = @first_attempt ? 0 : @backoff.next_interval
         @first_attempt = false
         if interval > 0
-          @logger.info { "Will retry connection after #{'%.3f' % interval} seconds" } 
+          @logger.info { "Will retry connection after #{'%.3f' % interval} seconds" }
           sleep(interval)
         end
         cxn = nil
         begin
           @logger.info { "Connecting to event stream at #{@uri}" }
           opts = { headers: build_headers }
-          opts[:json] = @http_payload unless @http_payload == {}
+          opts[:json] = @http_payload unless @http_payload.empty?
           cxn = @http_client.request(@http_method, @uri, opts)
           if cxn.status.code == 200
-            content_type = cxn.headers["content-type"]
+            content_type = cxn.content_type.mime_type
             if content_type && content_type.start_with?("text/event-stream")
               return cxn  # we're good to proceed
             else
               reset_http
-              err = Errors::HTTPContentTypeError.new(cxn.headers["content-type"])
+              err = Errors::HTTPContentTypeError.new(content_type)
               @on[:error].call(err)
-              @logger.warn { "Event source returned unexpected content type '#{cxn.headers["content-type"]}'" }
+              @logger.warn { "Event source returned unexpected content type '#{content_type}'" }
             end
           else
             body = cxn.to_s  # grab the whole response body in case it has error details
@@ -324,7 +328,7 @@ module SSE
               # readpartial gives us a string, which may not be a valid UTF-8 string because a
               # multi-byte character might not yet have been fully read, but BufferedLineReader
               # will handle that.
-            rescue HTTP::TimeoutError 
+            rescue HTTP::TimeoutError
               # For historical reasons, we rethrow this as our own type
               raise Errors::ReadTimeoutError.new(@read_timeout)
             end
@@ -353,7 +357,7 @@ module SSE
 
     def dispatch_event(event)
       @logger.debug { "Received event: #{event}" }
-      @last_id = event.id if !event.id.nil?
+      @last_id = event.id unless event.id.nil?
 
       # Pass the event to the caller
       @on[:event].call(event)
@@ -363,7 +367,7 @@ module SSE
       @logger.warn { "#{message}: #{e.inspect}"}
       @logger.debug { "Exception trace: #{e.backtrace}" }
       begin
-        @on[:error].call(e)      
+        @on[:error].call(e)
       rescue StandardError => ee
         @logger.warn { "Error handler threw an exception: #{ee.inspect}"}
         @logger.debug { "Exception trace: #{ee.backtrace}" }
@@ -374,7 +378,7 @@ module SSE
       h = {
         'Accept' => 'text/event-stream',
         'Cache-Control' => 'no-cache',
-        'User-Agent' => 'ruby-eventsource'
+        'User-Agent' => 'ruby-eventsource',
       }
       h['Last-Event-Id'] = @last_id if !@last_id.nil? && @last_id != ""
       h.merge(@headers)

@@ -203,6 +203,53 @@ EOT
     end
   end
 
+  def send_stream_content_without_content_type(res, content)
+    res.status = 200
+    res.chunked = true
+    rd, wr = IO.pipe
+    res.body = rd
+    wr.write(content)
+    res.header.delete("content-type")
+    wr
+  end
+
+  it "errors on missing content type by default" do
+    with_server do |server|
+      server.setup_response("/") do |req,res|
+        send_stream_content_without_content_type(res, simple_event_1_text)
+      end
+
+      error_sink = Queue.new
+      client = subject.new(server.base_uri, reconnect_time: reconnect_asap) do |c|
+        c.on_error { |error| error_sink << error }
+      end
+
+      with_client(client) do |c|
+        expect(error_sink.pop).to be_a(SSE::Errors::HTTPContentTypeError)
+      end
+    end
+  end
+
+  it "accepts missing content type when allow_missing_content_type is true" do
+    with_server do |server|
+      server.setup_response("/") do |req,res|
+        send_stream_content_without_content_type(res, simple_event_1_text)
+      end
+
+      event_sink = Queue.new
+      error_sink = Queue.new
+      client = subject.new(server.base_uri, reconnect_time: reconnect_asap, allow_missing_content_type: true) do |c|
+        c.on_event { |event| event_sink << event }
+        c.on_error { |error| error_sink << error }
+      end
+
+      with_client(client) do |c|
+        expect(event_sink.pop).to eq(simple_event_1)
+        expect(error_sink).to be_empty
+      end
+    end
+  end
+
   it "reconnects after read timeout" do
     events_body = simple_event_1_text
     with_server do |server|

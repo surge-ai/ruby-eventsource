@@ -149,6 +149,8 @@ module SSE
         .timeout({
           read: read_timeout,
           connect: connect_timeout,
+          # http.rb defaults this to 0.25s, which is under one cross-border RTT.
+          write: 30,
         })
       @cxn = nil
       @lock = Mutex.new

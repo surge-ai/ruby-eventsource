@@ -108,7 +108,8 @@ module SSE
           logger: nil,
           socket_factory: nil,
           parse: true,
-          verify_ssl: true)
+          verify_ssl: true,
+          allow_missing_content_type: false)
       @uri = URI(uri)
       @stopped = Concurrent::AtomicBoolean.new(false)
 
@@ -119,6 +120,7 @@ module SSE
       @http_payload = http_payload
       @logger = logger || default_logger
       @parse = parse
+      @allow_missing_content_type = allow_missing_content_type
       http_client_options = {}
       unless verify_ssl
         http_client_options[:ssl] = { verify_mode: OpenSSL::SSL::VERIFY_NONE }
@@ -292,6 +294,9 @@ module SSE
             content_type = cxn.content_type.mime_type
             if content_type && content_type.start_with?("text/event-stream")
               return cxn  # we're good to proceed
+            elsif content_type.to_s.empty? && @allow_missing_content_type
+              # Some providers (e.g. Tinker) stream SSE without a Content-Type header.
+              return cxn
             else
               reset_http
               err = Errors::HTTPContentTypeError.new(content_type)

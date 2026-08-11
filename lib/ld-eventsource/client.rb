@@ -281,6 +281,7 @@ module SSE
         if interval > 0
           @logger.info { "Will retry connection after #{'%.3f' % interval} seconds" }
           sleep(interval)
+          return if @stopped.value
         end
         cxn = nil
         begin
